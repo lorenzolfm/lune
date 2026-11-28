@@ -4491,10 +4491,10 @@ mod tests {
         assert_eq!(line(&menu, 11), " \u{f03ff} pi");
         let (menu, wants) = stays(menu.key(&KeyEvent::from(KeyCode::Tab)));
         assert_eq!(wants, Wants::Keep(Harness::Antigravity));
-        assert_eq!(line(&menu, 31), " \u{f0674} agy  <TAB> another agent");
+        assert_eq!(line(&menu, 31), " \u{f1a0} agy  <TAB> another agent");
         let (menu, wants) = stays(menu.key(&KeyEvent::from(KeyCode::Tab)));
         assert_eq!(wants, Wants::Keep(Harness::Codex));
-        assert_eq!(line(&menu, 31), " \u{f07b5} codex  <TAB> another agent");
+        assert_eq!(line(&menu, 31), " \u{ec81} codex  <TAB> another agent");
         let (menu, wants) = stays(menu.key(&KeyEvent::from(KeyCode::Tab)));
         assert_eq!(wants, Wants::Keep(CLAUDE));
         assert_eq!(line(&menu, 31), " \u{ec82} claude  <TAB> another agent");
