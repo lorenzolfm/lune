@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 use lune_protocol::git::Changed;
 use lune_protocol::github::Verdict;
 use lune_protocol::telemetry::{
-    AgentTelemetry, AgentUsage, ContextWindow, TelemetryText, UsedPermille,
+    AgentTelemetry, AgentUsage, ContextWindow, TelemetryText, UsageWindow, UsedPermille,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -130,8 +130,8 @@ pub struct Snapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum FitTier {
     Full,
-    Compact,
-    Trimmed,
+    NoResets,
+    NoBranch,
     NoView,
     NoGitDetails,
     NoProject,
@@ -142,9 +142,9 @@ enum FitTier {
 }
 
 impl FitTier {
-    const DEGRADED: [Self; 9] = [
-        Self::Compact,
-        Self::Trimmed,
+    const WHOLE: [Self; 3] = [Self::Full, Self::NoResets, Self::NoBranch];
+
+    const DEGRADED: [Self; 7] = [
         Self::NoView,
         Self::NoGitDetails,
         Self::NoProject,
@@ -175,7 +175,7 @@ impl FitTier {
     }
 
     const fn show_branch(self) -> bool {
-        matches!(self, Self::Full)
+        (self as u8) <= (Self::NoResets as u8)
     }
 
     const fn show_git_status(self) -> bool {
@@ -183,7 +183,7 @@ impl FitTier {
     }
 
     const fn show_changed(self) -> bool {
-        (self as u8) <= (Self::Compact as u8)
+        (self as u8) <= (Self::NoResets as u8)
     }
 
     const fn show_pr(self) -> bool {
@@ -191,11 +191,11 @@ impl FitTier {
     }
 
     const fn show_pr_marks(self) -> bool {
-        (self as u8) <= (Self::Compact as u8)
+        (self as u8) <= (Self::NoResets as u8)
     }
 
     const fn show_view(self) -> bool {
-        (self as u8) <= (Self::Trimmed as u8)
+        (self as u8) <= (Self::NoBranch as u8)
     }
 
     const fn show_context(self) -> bool {
@@ -209,58 +209,19 @@ impl FitTier {
     const fn show_resets(self) -> bool {
         matches!(self, Self::Full)
     }
-
-    const fn project_max(self) -> usize {
-        match self {
-            Self::Full => 20,
-            Self::Compact => 16,
-            Self::Trimmed | Self::NoView => 14,
-            Self::NoGitDetails => 12,
-            Self::NoProject
-            | Self::NoWorktree
-            | Self::NoModel
-            | Self::ContextOnly
-            | Self::Minimal => 0,
-        }
-    }
-
-    const fn worktree_max(self) -> usize {
-        match self {
-            Self::Full => 28,
-            Self::Compact => 20,
-            Self::Trimmed | Self::NoView => 16,
-            Self::NoGitDetails | Self::NoProject => 14,
-            Self::NoWorktree | Self::NoModel | Self::ContextOnly | Self::Minimal => 0,
-        }
-    }
-
-    const fn default_view_max(self) -> usize {
-        match self {
-            Self::Full => 36,
-            Self::Compact => 20,
-            Self::Trimmed => 14,
-            Self::NoView
-            | Self::NoGitDetails
-            | Self::NoProject
-            | Self::NoWorktree
-            | Self::NoModel
-            | Self::ContextOnly
-            | Self::Minimal => 0,
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
 struct FitPolicy {
     tier: FitTier,
-    view_max: usize,
+    view_max: Option<usize>,
 }
 
 impl FitPolicy {
     const fn of(tier: FitTier) -> Self {
         Self {
             tier,
-            view_max: tier.default_view_max(),
+            view_max: None,
         }
     }
 }
@@ -368,22 +329,26 @@ pub fn draw(
 }
 
 fn fit(snapshot: &Snapshot, inner: usize, spinner_frame: SpinnerFrame, wall: SystemTime) -> Built {
-    let full_policy = FitPolicy::of(FitTier::Full);
-    let full = build(snapshot, full_policy, spinner_frame, wall);
-    if full.needed_width() <= inner {
-        return full;
+    let mut tightest = FitTier::Full;
+    for tier in FitTier::WHOLE {
+        let built = build(snapshot, FitPolicy::of(tier), spinner_frame, wall);
+        if built.needed_width() <= inner {
+            return built;
+        }
+        tightest = tier;
+        assert!(tier.show_view());
     }
     if let Some(view) = snapshot.view.as_ref() {
-        let overflow = full.needed_width() - inner;
-        let current_view_len = cells(&view.label).min(full_policy.view_max);
-        if let Some(trimmed) = current_view_len.checked_sub(overflow)
+        let whole = build(snapshot, FitPolicy::of(tightest), spinner_frame, wall);
+        let overflow = whole.needed_width() - inner;
+        if let Some(trimmed) = cells(&view.label).checked_sub(overflow)
             && trimmed >= VIEW_LABEL_SOFT_MIN
         {
-            let soft = FitPolicy {
-                tier: FitTier::Full,
-                view_max: trimmed,
+            let cut = FitPolicy {
+                tier: tightest,
+                view_max: Some(trimmed),
             };
-            let built = build(snapshot, soft, spinner_frame, wall);
+            let built = build(snapshot, cut, spinner_frame, wall);
             if built.needed_width() <= inner {
                 return built;
             }
@@ -555,40 +520,38 @@ fn effort_style(effort: &str) -> Style {
 }
 
 fn build_project(snapshot: &Snapshot, policy: FitPolicy) -> Option<Vec<Span<'static>>> {
-    let project_max = policy.tier.project_max();
-    if !policy.tier.show_project() || project_max == 0 {
+    if !policy.tier.show_project() {
         return None;
     }
     let project = snapshot.project.as_ref()?;
     let mut spans = Vec::new();
     if let Some(machine) = &snapshot.machine {
-        let host = cut(machine, 12);
+        let host = whole(machine);
         spans.push(Span::styled(
             format!("{host}:"),
             Style::new().fg(moonlight::MUTE),
         ));
     }
     spans.push(Span::styled(
-        cut(&project.name, project_max),
+        whole(&project.name),
         Style::new().fg(project.colour).add_modifier(Modifier::BOLD),
     ));
     Some(spans)
 }
 
 fn build_worktree(snapshot: &Snapshot, policy: FitPolicy) -> Option<WorktreeRendered> {
-    let worktree_max = policy.tier.worktree_max();
-    if !policy.tier.show_worktree() || worktree_max == 0 {
+    if !policy.tier.show_worktree() {
         return None;
     }
     let worktree = snapshot.worktree.as_ref()?;
     let mut spans = vec![Span::styled(
-        cut(&worktree.name, worktree_max),
+        whole(&worktree.name),
         Style::new().fg(moonlight::TEXT),
     )];
     if policy.tier.show_branch()
         && let Some(branch) = &worktree.branch
     {
-        let branch = cut(branch, worktree_max);
+        let branch = whole(branch);
         spans.push(Span::styled(
             format!(" ({branch})"),
             Style::new().fg(moonlight::MUTE),
@@ -674,7 +637,7 @@ fn build_view(
     policy: FitPolicy,
     spinner_frame: SpinnerFrame,
 ) -> Option<Vec<Span<'static>>> {
-    if !policy.tier.show_view() || policy.view_max == 0 {
+    if !policy.tier.show_view() {
         return None;
     }
     let view = snapshot.view.as_ref()?;
@@ -693,7 +656,10 @@ fn build_view(
         spans.push(Span::styled(icon, label_style));
         spans.push(Span::raw(" "));
     }
-    let shown = cut(&view.label, policy.view_max);
+    let shown = match policy.view_max {
+        Some(room) => cut(&view.label, room),
+        None => whole(&view.label),
+    };
     if shown.is_empty() && spans.is_empty() {
         return None;
     }
@@ -747,6 +713,11 @@ fn render_usage(
     cadence: &mut Cadence,
 ) -> Option<Vec<Span<'static>>> {
     if usage.has_windows() {
+        let running = |window: &&UsageWindow| window.resets_at.is_none_or(|at| at > wall);
+        let running: Vec<&UsageWindow> = usage.windows().iter().filter(running).collect();
+        if running.is_empty() {
+            return None;
+        }
         let mut spans = Vec::new();
         if let Some(harness) = fallback_harness {
             spans.push(Span::styled(
@@ -755,7 +726,7 @@ fn render_usage(
             ));
             spans.push(Span::raw(" "));
         }
-        for (index, window) in usage.windows().iter().enumerate() {
+        for (index, window) in running.into_iter().enumerate() {
             if index > 0 {
                 spans.push(Span::styled(DOT_SEP, Style::new().fg(moonlight::MUTE)));
             }
@@ -768,13 +739,17 @@ fn render_usage(
                 format_percent(window.used_permille, false),
                 pressure_style(window.used_permille),
             ));
-            if show_resets
-                && let Some(resets_at) = window.resets_at
-                && let Some((countdown, next_tick)) = format_countdown(resets_at, wall)
-            {
-                cadence.clock_at(next_tick, wall);
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(countdown, Style::new().fg(moonlight::MUTE)));
+            let Some(resets_at) = window.resets_at else {
+                continue;
+            };
+            assert!(resets_at > wall);
+            match format_countdown(resets_at, wall).filter(|_| show_resets) {
+                Some((countdown, next_tick)) => {
+                    cadence.clock_at(next_tick, wall);
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(countdown, Style::new().fg(moonlight::MUTE)));
+                }
+                None => cadence.clock_at(resets_at, wall),
             }
         }
         return Some(spans);
@@ -912,15 +887,19 @@ fn cells(text: &str) -> usize {
 }
 
 #[must_use]
+fn whole(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_control())
+        .collect()
+}
+
+#[must_use]
 fn cut(text: &str, room: usize) -> String {
     if room == 0 {
         return String::new();
     }
     if cells(text) <= room {
-        return text
-            .chars()
-            .filter(|character| !character.is_control())
-            .collect();
+        return whole(text);
     }
     let keep = room.saturating_sub(1);
     let mut out = String::new();
@@ -944,8 +923,6 @@ fn cut(text: &str, room: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::time::UNIX_EPOCH;
-
-    use lune_protocol::telemetry::UsageWindow;
 
     use super::*;
     use crate::clock::Moment;
@@ -1084,6 +1061,103 @@ mod tests {
                 assert!(rendered.contains(MOON), "width={width}: {rendered:?}");
             }
         }
+    }
+
+    #[test]
+    fn long_names_show_whole_and_details_go_before_the_view_label_is_cut() {
+        let wall = UNIX_EPOCH + Duration::from_secs(1_800_000_007);
+        let mut snapshot = full_snapshot(wall);
+        let worktree = "fix-the-status-line-for-every-harness-we-run";
+        let label = "Debug and fix the status line telemetry for Claude Code and Codex";
+        snapshot.worktree.as_mut().unwrap().name = worktree.to_owned();
+        snapshot.worktree.as_mut().unwrap().branch = Some("a-branch-of-another-name".to_owned());
+        snapshot.view.as_mut().unwrap().label = label.to_owned();
+        let drawn = |width: u16| {
+            let area = Rect::new(0, 0, width, 1);
+            let mut buffer = Buffer::empty(area);
+            draw(&mut buffer, area, &snapshot, SpinnerFrame::REST, wall);
+            row_text(&buffer, area)
+        };
+
+        let roomy = drawn(260);
+        assert!(roomy.contains(worktree), "{roomy}");
+        assert!(roomy.contains("(a-branch-of-another-name)"), "{roomy}");
+        assert!(roomy.contains(label), "{roomy}");
+        assert!(roomy.contains("7d 82% 2d4h"), "{roomy}");
+        assert!(!roomy.contains('…'), "{roomy}");
+
+        let mut whole_label_widths = 0;
+        let mut cut_label_widths = 0;
+        for width in (0..260u16).rev() {
+            let row = drawn(width);
+            if row.contains(label) {
+                whole_label_widths += 1;
+                assert_eq!(cut_label_widths, 0, "width={width}: {row}");
+                continue;
+            }
+            if row.contains('…') {
+                cut_label_widths += 1;
+                assert!(row.contains(worktree), "width={width}: {row}");
+                assert!(row.contains("Debug and f"), "width={width}: {row}");
+                assert!(!row.contains("2d4h"), "width={width}: {row}");
+                assert!(!row.contains("a-branch"), "width={width}: {row}");
+                continue;
+            }
+            assert!(!row.contains("Debug"), "width={width}: {row}");
+            let named = row.contains("fix-the");
+            assert_eq!(named, row.contains(worktree), "width={width}: {row}");
+        }
+        assert!(whole_label_widths > 0);
+        assert!(cut_label_widths > 0);
+    }
+
+    #[test]
+    fn a_window_that_has_reset_is_not_shown_and_the_bar_wakes_when_one_resets() {
+        let wall = UNIX_EPOCH + Duration::from_secs(1_800_000_007);
+        let mut snapshot = full_snapshot(wall);
+        let window = |label: &str, resets_at: Option<SystemTime>| UsageWindow {
+            label: text(label),
+            used_permille: UsedPermille::try_new(350).unwrap(),
+            resets_at,
+        };
+        let told = |windows: Vec<UsageWindow>| {
+            AgentTelemetry::new(
+                Some(text("gpt-6.2-sol")),
+                None,
+                None,
+                AgentUsage::new(windows, None),
+            )
+        };
+        let reset = window("5h", Some(wall));
+        let running = window("7d", Some(wall + Duration::from_hours(52)));
+        snapshot.view.as_mut().unwrap().telemetry = told(vec![reset.clone(), running]);
+        let drawn = |snapshot: &Snapshot, width: u16| {
+            let area = Rect::new(0, 0, width, 1);
+            let mut buffer = Buffer::empty(area);
+            let (_, cadence) = draw(&mut buffer, area, snapshot, SpinnerFrame::REST, wall);
+            (row_text(&buffer, area), cadence)
+        };
+        let (row, _) = drawn(&snapshot, 160);
+        assert!(row.contains("─ 7d 35% 2d4h"), "{row}");
+        assert!(!row.contains("5h"), "{row}");
+
+        snapshot.view.as_mut().unwrap().telemetry = told(vec![reset]);
+        let (row, cadence) = drawn(&snapshot, 160);
+        assert!(!row.contains("5h"), "{row}");
+        assert_eq!(cadence, Cadence::default());
+
+        let soon = window("5h", Some(wall + Duration::from_mins(90)));
+        snapshot.view.as_mut().unwrap().telemetry = told(vec![soon]);
+        let label = "Debug and fix the status line telemetry for Claude Code and Codex";
+        snapshot.view.as_mut().unwrap().label = label.repeat(2);
+        let (row, cadence) = drawn(&snapshot, 100);
+        assert!(row.contains("5h 35%"), "{row}");
+        assert!(!row.contains("1h30m"), "{row}");
+        let now = Moment {
+            steady: std::time::Instant::now(),
+            system: wall,
+        };
+        assert_eq!(cadence.wait(now, now), Some(Duration::from_mins(90)));
     }
 
     #[test]

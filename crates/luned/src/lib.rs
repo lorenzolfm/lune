@@ -10,6 +10,7 @@ mod claude;
 mod claude_status;
 mod client;
 mod codex;
+mod codex_rollout;
 mod core;
 mod daemon;
 mod devices;

@@ -11,9 +11,11 @@ use std::time::{Duration, SystemTime};
 use lune_domain::agent::Harness;
 use lune_protocol::program_resume::ProcessArgv;
 use lune_protocol::said::Said;
+use lune_protocol::telemetry::AgentTelemetry;
 use serde::Deserialize;
 
 use crate::agent::{Agent, Name, Source};
+use crate::codex_rollout::Rollouts;
 use crate::core::{self, Command};
 use crate::process::{self, AgentId};
 use crate::resume::trust;
@@ -55,6 +57,7 @@ pub fn folder() -> Option<PathBuf> {
 pub struct Thread {
     pub session: Said,
     pub name: Option<Name>,
+    pub telemetry: Option<AgentTelemetry>,
 }
 
 pub type Held = HashMap<AgentId, Thread>;
@@ -206,6 +209,7 @@ fn inside_each() -> Inside {
 
 pub struct Threads {
     locks: Option<PathBuf>,
+    rollouts: Rollouts,
     codex: PathBuf,
     index: Index,
     troubles: Troubles,
@@ -216,6 +220,7 @@ impl Threads {
     pub fn new(codex: PathBuf) -> Threads {
         Threads {
             locks: None,
+            rollouts: Rollouts::new(&codex),
             codex,
             index: Index::default(),
             troubles: Troubles::default(),
@@ -304,6 +309,11 @@ impl Threads {
         if sessions.is_empty() {
             return held;
         }
+        let written: Vec<&str> = sessions
+            .iter()
+            .map(|(_, session)| session.as_str())
+            .collect();
+        let told = self.rollouts.told(&written);
         let names = self.names();
         for (agent, session) in sessions {
             let name = names.get(session.as_str()).map(|text| Name {
@@ -312,7 +322,15 @@ impl Threads {
             });
             let session =
                 Said::new(session.as_str().to_owned()).expect("a session id is never empty");
-            held.insert(agent, Thread { session, name });
+            let telemetry = told.get(session.as_str()).cloned();
+            held.insert(
+                agent,
+                Thread {
+                    session,
+                    name,
+                    telemetry,
+                },
+            );
         }
         held
     }
@@ -612,6 +630,7 @@ mod tests {
         let unnamed = Thread {
             session: Said::new(OLDER.to_owned()).unwrap(),
             name: None,
+            telemetry: None,
         };
         let now = threads.held_by(std::slice::from_ref(&me));
         assert_eq!(now, Held::from([(id.clone(), unnamed.clone())]));
