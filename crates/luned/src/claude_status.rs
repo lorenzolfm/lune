@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, Metadata, OpenOptions, Permissions, TryLockError};
 use std::io::{self, ErrorKind, Read as _, Write as _};
 use std::num::NonZeroU64;
+use std::ops::Range;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use lune_protocol::said::Said;
 use lune_protocol::telemetry::{
     AgentTelemetry, AgentUsage, ContextWindow, TelemetryText, UsageWindow, UsedPermille,
-    cost_usd_to_micro_usd, strip_effort_suffix,
+    cost_usd_to_micro_usd, share_windows, strip_effort_suffix,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -125,6 +126,7 @@ struct Payload {
     effort: Option<Value>,
     #[serde(alias = "effortLevel")]
     effort_level: Option<Value>,
+    thinking: Option<Value>,
     context_window: Option<Value>,
     rate_limits: Option<Value>,
     cost: Option<Value>,
@@ -392,6 +394,7 @@ impl StatusFiles {
         assert_eq!(entries.len(), processes.len());
         self.processes = processes;
         self.troubles.done();
+        share_windows(entries.iter_mut().map(|entry| &mut entry.telemetry));
         entries
     }
 }
@@ -438,10 +441,11 @@ impl Payload {
         let model_id = model_obj
             .and_then(|model| model.get("id"))
             .and_then(Value::as_str);
+        let tells_effort = self.effort.is_some() || self.thinking.is_some();
         let effort = self
             .effort
             .as_ref()
-            .and_then(Value::as_str)
+            .and_then(effort_level)
             .or_else(|| self.effort_level.as_ref().and_then(Value::as_str))
             .or_else(|| {
                 model_obj
@@ -450,7 +454,13 @@ impl Payload {
             })
             .map(str::to_ascii_lowercase)
             .and_then(|text| TelemetryText::parse(&text))
-            .or_else(|| efforts.resolve(model_id));
+            .or_else(|| {
+                if tells_effort {
+                    None
+                } else {
+                    efforts.resolve(model_id)
+                }
+            });
         let model = model_obj
             .and_then(|model| {
                 model
@@ -466,6 +476,12 @@ impl Payload {
         let usage = parse_usage(self.rate_limits.as_ref(), self.cost.as_ref());
         AgentTelemetry::new(model, effort, context, usage)
     }
+}
+
+fn effort_level(effort: &Value) -> Option<&str> {
+    effort
+        .as_str()
+        .or_else(|| effort.get("level").and_then(Value::as_str))
 }
 
 fn parse_nonneg_secs(value: &Value) -> Option<u64> {
@@ -523,6 +539,10 @@ fn parse_context(raw: &Value) -> Option<ContextWindow> {
         .get("context_window_size")
         .and_then(Value::as_u64)
         .and_then(NonZeroU64::new);
+    let unused = raw
+        .get("current_usage")
+        .is_some_and(Value::is_null)
+        .then_some(0);
     let used_tokens = raw
         .get("current_usage")
         .and_then(Value::as_object)
@@ -541,7 +561,8 @@ fn parse_context(raw: &Value) -> Option<ContextWindow> {
                     .saturating_add(cache_creation.unwrap_or(0))
                     .saturating_add(cache_read.unwrap_or(0)),
             )
-        });
+        })
+        .or(unused);
     let used_permille = raw
         .get("used_percentage")
         .and_then(Value::as_f64)
@@ -837,6 +858,7 @@ enum SettingsSnapshot {
     Missing,
     Present {
         map: Map<String, Value>,
+        text: String,
         stamp: FileStamp,
         mode: u32,
     },
@@ -850,10 +872,10 @@ impl SettingsSnapshot {
         }
     }
 
-    fn into_map(self) -> Map<String, Value> {
+    fn into_map_and_text(self) -> (Map<String, Value>, Option<String>) {
         match self {
-            SettingsSnapshot::Missing => Map::new(),
-            SettingsSnapshot::Present { map, .. } => map,
+            SettingsSnapshot::Missing => (Map::new(), None),
+            SettingsSnapshot::Present { map, text, .. } => (map, Some(text)),
         }
     }
 
@@ -896,17 +918,183 @@ fn read_settings(settings_path: &Path) -> io::Result<SettingsSnapshot> {
             Err(error) => return Err(io::Error::new(ErrorKind::InvalidData, error)),
         }
     };
-    Ok(SettingsSnapshot::Present { map, stamp, mode })
+    let text = text.to_owned();
+    Ok(SettingsSnapshot::Present {
+        map,
+        text,
+        stamp,
+        mode,
+    })
 }
 
-fn write_settings(
-    settings_path: &Path,
-    object: &Map<String, Value>,
-    mode: u32,
-) -> io::Result<FileStamp> {
-    let mut text = serde_json::to_string_pretty(object)?;
+fn settings_target(settings_path: &Path) -> io::Result<Option<PathBuf>> {
+    if !is_symlink(settings_path) {
+        return Ok(Some(settings_path.to_owned()));
+    }
+    match fs::canonicalize(settings_path) {
+        Ok(target) => Ok(Some(target)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn takes_writes(target: &Path) -> bool {
+    OpenOptions::new().write(true).open(target).is_ok()
+}
+
+struct Member {
+    value: Option<Range<usize>>,
+    close: usize,
+    indent: String,
+}
+
+fn string_end(bytes: &[u8], open: usize) -> Option<usize> {
+    assert_eq!(bytes.get(open), Some(&b'"'));
+    let mut at = open + 1;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'"' => return Some(at + 1),
+            _ => at += 1,
+        }
+    }
+    None
+}
+
+fn value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    match *bytes.get(start)? {
+        b'"' => string_end(bytes, start),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut at = start;
+            while at < bytes.len() {
+                match bytes[at] {
+                    b'"' => {
+                        at = string_end(bytes, at)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(at + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                at += 1;
+            }
+            None
+        }
+        _ => {
+            let ends = |byte: &u8| matches!(byte, b',' | b'}' | b']') || byte.is_ascii_whitespace();
+            let length = bytes[start..].iter().position(ends)?;
+            (length > 0).then_some(start + length)
+        }
+    }
+}
+
+fn member_of(text: &str, key: &str) -> Option<Member> {
+    let bytes = text.as_bytes();
+    let blank = |from: usize| {
+        let skipped = bytes.get(from..)?.iter();
+        let length = skipped
+            .take_while(|byte| byte.is_ascii_whitespace())
+            .count();
+        Some(from + length)
+    };
+    let open = blank(0)?;
+    if bytes.get(open) != Some(&b'{') {
+        return None;
+    }
+    let first = blank(open + 1)?;
+    if bytes.get(first) != Some(&b'"') {
+        return None;
+    }
+    let (_, indent) = text.get(open + 1..first)?.rsplit_once('\n')?;
+    let mut value = None;
+    let mut at = first;
+    loop {
+        if bytes.get(at) == Some(&b'}') {
+            break;
+        }
+        if bytes.get(at) != Some(&b'"') {
+            return None;
+        }
+        let named = string_end(bytes, at)?;
+        let colon = blank(named)?;
+        if bytes.get(colon) != Some(&b':') {
+            return None;
+        }
+        let start = blank(colon + 1)?;
+        let end = value_end(bytes, start)?;
+        if text.get(at + 1..named - 1) == Some(key) && value.is_none() {
+            value = Some(start..end);
+        }
+        at = blank(end)?;
+        match bytes.get(at) {
+            Some(b',') => at = blank(at + 1)?,
+            Some(b'}') => {}
+            Some(_) | None => return None,
+        }
+    }
+    Some(Member {
+        value,
+        close: at,
+        indent: indent.to_owned(),
+    })
+}
+
+fn indented(value: &Value, indent: &str) -> io::Result<String> {
+    use serde::Serialize as _;
+    let mut out = Vec::new();
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
+    let mut serializer = serde_json::Serializer::with_formatter(&mut out, formatter);
+    value.serialize(&mut serializer)?;
+    let text =
+        String::from_utf8(out).map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
+    Ok(text.replace('\n', &format!("\n{indent}")))
+}
+
+fn spliced(text: &str, key: &str, value: &Value) -> Option<String> {
+    let member = member_of(text, key)?;
+    let rendered = indented(value, &member.indent).ok()?;
+    let mut out = String::with_capacity(text.len() + rendered.len() + key.len() + 16);
+    if let Some(span) = member.value {
+        out.push_str(&text[..span.start]);
+        out.push_str(&rendered);
+        out.push_str(&text[span.end..]);
+    } else {
+        out.push_str(text[..member.close].trim_end());
+        out.push_str(",\n");
+        out.push_str(&member.indent);
+        out.push_str(&serde_json::to_string(key).ok()?);
+        out.push_str(": ");
+        out.push_str(&rendered);
+        out.push('\n');
+        out.push_str(&text[member.close..]);
+    }
+    Some(out)
+}
+
+fn settings_text(
+    was: Option<&str>,
+    mut settings: Map<String, Value>,
+    status_line: Map<String, Value>,
+) -> io::Result<String> {
+    let key = "statusLine";
+    let status_line = Value::Object(status_line);
+    let kept = was.and_then(|was| spliced(was, key, &status_line));
+    settings.insert(key.to_owned(), status_line);
+    let wanted = Value::Object(settings);
+    if let Some(kept) = kept
+        && serde_json::from_str::<Value>(&kept).is_ok_and(|read| read == wanted)
+    {
+        return Ok(kept);
+    }
+    let mut text = serde_json::to_string_pretty(&wanted)?;
     text.push('\n');
-    atomic_write(settings_path, text.as_bytes(), mode)
+    Ok(text)
 }
 
 enum ChainSource {
@@ -1016,8 +1204,7 @@ fn install(claude: &Path, lune: &Path) -> io::Result<InstallOutcome> {
     assert_ne!(ours, "");
 
     let settings_symlink = is_symlink(&settings_path);
-    let snapshot = read_settings(&settings_path)?;
-    if settings_symlink && snapshot.stamp().is_none() {
+    let Some(target) = settings_target(&settings_path)? else {
         return Ok(InstallOutcome::Installed {
             stamp: InstalledStamp {
                 settings: None,
@@ -1026,11 +1213,12 @@ fn install(claude: &Path, lune: &Path) -> io::Result<InstallOutcome> {
             },
             efforts: EffortSettings::default(),
             note: Some(format!(
-                "{} is a symlink; skipping statusLine wiring",
+                "{} links to a file that is missing; skipping statusLine wiring",
                 settings_path.display()
             )),
         });
-    }
+    };
+    let snapshot = read_settings(&target)?;
     let efforts = snapshot
         .map()
         .map(EffortSettings::from_map)
@@ -1087,7 +1275,7 @@ fn install(claude: &Path, lune: &Path) -> io::Result<InstallOutcome> {
             })
         }
         StatusLineAction::Wire(source) => {
-            if settings_symlink {
+            if settings_symlink && !takes_writes(&target) {
                 return Ok(InstallOutcome::Installed {
                     stamp: InstalledStamp {
                         settings: snapshot.stamp(),
@@ -1096,8 +1284,9 @@ fn install(claude: &Path, lune: &Path) -> io::Result<InstallOutcome> {
                     },
                     efforts,
                     note: Some(format!(
-                        "{} is a symlink; skipping statusLine wiring",
-                        settings_path.display()
+                        "{} links to {}, which takes no writes; skipping statusLine wiring",
+                        settings_path.display(),
+                        target.display()
                     )),
                 });
             }
@@ -1125,18 +1314,17 @@ fn install(claude: &Path, lune: &Path) -> io::Result<InstallOutcome> {
             let text = script(lune, chain.as_ref())?;
             let script_stamp = write_script(&script_path, &text, existing.as_deref())?;
 
-            if file_stamp(&settings_path) != snapshot.stamp() || is_symlink(&settings_path) {
+            if file_stamp(&target) != snapshot.stamp()
+                || settings_target(&settings_path)?.as_deref() != Some(target.as_path())
+            {
                 return Ok(InstallOutcome::Retry);
             }
             let mode = snapshot.mode();
-            let mut settings = snapshot.into_map();
-            let mut status_line = settings
-                .remove("statusLine")
-                .and_then(|value| match value {
-                    Value::Object(map) => Some(map),
-                    _ => None,
-                })
-                .unwrap_or_default();
+            let (settings, was) = snapshot.into_map_and_text();
+            let mut status_line = match settings.get("statusLine") {
+                Some(Value::Object(map)) => map.clone(),
+                Some(_) | None => Map::new(),
+            };
             status_line
                 .entry("type".to_owned())
                 .or_insert_with(|| Value::String("command".to_owned()));
@@ -1144,12 +1332,12 @@ fn install(claude: &Path, lune: &Path) -> io::Result<InstallOutcome> {
             status_line
                 .entry("padding".to_owned())
                 .or_insert_with(|| Value::Number(0.into()));
-            settings.insert("statusLine".to_owned(), Value::Object(status_line));
-            let settings_stamp = write_settings(&settings_path, &settings, mode)?;
+            let text = settings_text(was.as_deref(), settings, status_line)?;
+            let settings_stamp = atomic_write(&target, text.as_bytes(), mode)?;
             Ok(InstallOutcome::Installed {
                 stamp: InstalledStamp {
                     settings: Some(settings_stamp),
-                    settings_symlink: false,
+                    settings_symlink,
                     script: Some(script_stamp),
                 },
                 efforts,
@@ -1411,6 +1599,160 @@ mod tests {
             panic!("expected invalid statusLine to report Failed while preserving efforts");
         };
         assert_eq!(efforts.resolve(None).unwrap().as_str(), "max");
+    }
+
+    #[test]
+    fn install_writes_through_a_settings_symlink_and_keeps_the_file_as_it_was_written() {
+        use std::os::unix::fs::symlink;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let claude = scratch.path().join("claude");
+        let lune = scratch.path().join("lune");
+        let dotfiles = scratch.path().join("dotfiles");
+        fs::create_dir_all(&claude).unwrap();
+        fs::create_dir_all(lune.join(FOLDER)).unwrap();
+        fs::create_dir_all(&dotfiles).unwrap();
+        let kept = dotfiles.join("settings.json");
+        let settings_path = claude.join(SETTINGS_FILE);
+        symlink(&kept, &settings_path).unwrap();
+        let ours = own_command(&claude.join(SCRIPT_FILE)).unwrap();
+        let quoted = serde_json::to_string(&ours).unwrap();
+
+        let unwired = "{\n    \"model\": \"fable\",\n    \"effortLevel\": \"high\",\n    \"allow\": [\"a}\", \"b\\\"\"]\n}\n";
+        fs::write(&kept, unwired).unwrap();
+        let InstallOutcome::Installed { efforts, note, .. } = install(&claude, &lune).unwrap()
+        else {
+            panic!("expected a writable symlinked settings file to be wired");
+        };
+        assert_eq!(note, None);
+        assert_eq!(efforts.resolve(None).unwrap().as_str(), "high");
+        assert!(is_symlink(&settings_path));
+        assert!(!is_symlink(&kept));
+        let wired = format!(
+            "{{\n    \"model\": \"fable\",\n    \"effortLevel\": \"high\",\n    \"allow\": [\"a}}\", \"b\\\"\"],\n    \"statusLine\": {{\n        \"command\": {quoted},\n        \"padding\": 0,\n        \"type\": \"command\"\n    }}\n}}\n"
+        );
+        assert_eq!(fs::read_to_string(&kept).unwrap(), wired);
+        let leftovers: Vec<PathBuf> = watch::listed(&dotfiles).unwrap();
+        assert_eq!(leftovers, std::slice::from_ref(&kept));
+
+        let mut files = StatusFiles::new(&lune, Some(claude.clone()));
+        assert_eq!(files.scan(), Vec::new());
+        assert!(files.installed.is_some());
+        assert_eq!(fs::read_to_string(&kept).unwrap(), wired);
+
+        let chained = "{\n  \"statusLine\": {\n    \"type\": \"command\",\n    \"command\": \"~/.claude/statusline.sh\",\n    \"refreshInterval\": 5\n  },\n  \"model\": \"opus[1m]\"\n}\n";
+        fs::write(&kept, chained).unwrap();
+        let InstallOutcome::Installed { note, .. } = install(&claude, &lune).unwrap() else {
+            panic!("expected a user's own command to be chained");
+        };
+        assert_eq!(note, None);
+        assert_eq!(
+            fs::read_to_string(&kept).unwrap(),
+            format!(
+                "{{\n  \"statusLine\": {{\n    \"command\": {quoted},\n    \"padding\": 0,\n    \"refreshInterval\": 5,\n    \"type\": \"command\"\n  }},\n  \"model\": \"opus[1m]\"\n}}\n"
+            )
+        );
+        assert_eq!(
+            chain_of(&claude.join(SCRIPT_FILE)).as_deref(),
+            Some("~/.claude/statusline.sh")
+        );
+
+        fs::write(&kept, "{\"model\":\"fable\"}").unwrap();
+        install(&claude, &lune).unwrap();
+        let rewritten: Value = serde_json::from_str(&fs::read_to_string(&kept).unwrap()).unwrap();
+        assert_eq!(
+            rewritten,
+            json!({
+                "model": "fable",
+                "statusLine": { "type": "command", "command": ours, "padding": 0 }
+            }),
+            "a file on one line is written anew"
+        );
+    }
+
+    #[test]
+    fn claude_tells_its_effort_as_a_level_and_none_for_a_model_that_takes_none() {
+        let settings = json!({ "effortLevel": "high" });
+        let efforts = EffortSettings::from_map(settings.as_object().unwrap());
+        let told = |state: Value| {
+            let envelope: Envelope =
+                serde_json::from_value(json!({ "procStart": "42", "state": state })).unwrap();
+            let telemetry = envelope.state.telemetry(&efforts).unwrap();
+            telemetry.effort().map(|effort| effort.as_str().to_owned())
+        };
+        let model = json!({ "id": "claude-fable-5-2", "display_name": "Fable 5.2" });
+        assert_eq!(
+            told(json!({
+                "model": model,
+                "effort": { "level": "xhigh" },
+                "thinking": { "enabled": true }
+            }))
+            .as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            told(json!({ "model": model, "effort": "Max" })).as_deref(),
+            Some("max")
+        );
+        assert_eq!(
+            told(json!({ "model": model, "thinking": { "enabled": false } })),
+            None,
+            "a claude that tells its thinking tells its effort when the model takes one"
+        );
+        assert_eq!(told(json!({ "model": model })).as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn a_claude_that_has_asked_nothing_yet_has_used_none_of_its_context() {
+        let fresh = json!({
+            "total_input_tokens": 0,
+            "context_window_size": 1_000_000,
+            "current_usage": null,
+            "used_percentage": null
+        });
+        let context = parse_context(&fresh).unwrap();
+        assert_eq!(context.used_permille, UsedPermille::ZERO);
+        assert_eq!(context.used_tokens, Some(0));
+        assert_eq!(context.window_tokens.map(NonZeroU64::get), Some(1_000_000));
+        assert_eq!(parse_context(&json!({ "current_usage": null })), None);
+    }
+
+    #[test]
+    fn claudes_on_one_account_show_its_freshest_windows() {
+        let scratch = tempfile::tempdir().unwrap();
+        let lune = scratch.path().join("lune");
+        fs::create_dir_all(lune.join(FOLDER)).unwrap();
+        let state = |used: f64| {
+            json!({
+                "model": { "id": "claude-fable-5-2", "display_name": "Fable 5.2" },
+                "rate_limits": {
+                    "seven_day": { "used_percentage": used, "resets_at": 1_900_000_000_u64 }
+                },
+                "cost": { "total_cost_usd": 0.5 }
+            })
+        };
+        let mut children = Vec::new();
+        for used in [12.0, 63.0] {
+            let child = Command::new("sleep").arg("60").spawn().unwrap();
+            let start = process::start(child.id()).unwrap();
+            let envelope = json!({ "procStart": start.as_str(), "state": state(used) });
+            let file = lune.join(FOLDER).join(format!("{}.json", child.id()));
+            fs::write(file, envelope.to_string()).unwrap();
+            children.push(child);
+        }
+        let mut files = StatusFiles::new(&lune, None);
+        let entries = files.scan();
+        for child in &mut children {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert_eq!(entries.len(), 2);
+        for entry in &entries {
+            let usage = entry.telemetry.usage().unwrap();
+            assert_eq!(usage.windows().len(), 1);
+            assert_eq!(usage.windows()[0].used_permille.get(), 630);
+            assert_eq!(usage.session_cost_micro_usd(), Some(500_000));
+        }
     }
 
     #[test]

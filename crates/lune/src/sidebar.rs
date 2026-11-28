@@ -4056,10 +4056,11 @@ impl SidebarState {
             .and_then(|info| info.telemetry.as_ref())
             .and_then(AgentTelemetry::usage)
             .is_some();
+        let harness = view.as_ref().and_then(|info| info.harness);
         let fallback_usage = if has_own_usage {
             None
         } else {
-            self.fallback_subscription_usage(usage_machine, last_usage, wall)
+            self.fallback_subscription_usage(usage_machine, harness, last_usage, wall)
         };
         statusbar::Snapshot {
             sidebar_focused,
@@ -4077,16 +4078,20 @@ impl SidebarState {
     fn fallback_subscription_usage(
         &self,
         on: &Machine,
+        focused: Option<agents::Harness>,
         last_usage: Option<&(agents::Harness, AgentUsage)>,
         wall: SystemTime,
     ) -> Option<(agents::Harness, AgentUsage)> {
-        let preferred = last_usage.map(|(harness, _)| *harness);
+        let preferred = focused.or_else(|| last_usage.map(|(harness, _)| *harness));
         let from_seen = |seen: Seen<'_>| {
             let mut candidates: Vec<(agents::Harness, u32, AgentUsage)> = seen
                 .agents
                 .iter()
                 .filter_map(|agent| {
                     let harness = agents::of(agent)?;
+                    if focused.is_some_and(|focused| focused != harness) {
+                        return None;
+                    }
                     let telemetry = agent.parsed_telemetry()?;
                     let usage = telemetry.usage()?.clone();
                     usage.has_windows().then_some((harness, agent.pid, usage))
@@ -4108,6 +4113,9 @@ impl SidebarState {
             let (harness, _, usage) = candidates.into_iter().next()?;
             Some((harness, usage))
         };
+        if focused.is_some() {
+            return self.seen(on).and_then(from_seen);
+        }
         self.seen(on)
             .and_then(from_seen)
             .or_else(|| {

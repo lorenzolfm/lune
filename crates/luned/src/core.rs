@@ -1228,7 +1228,7 @@ impl Known {
                 name: thread.and_then(|thread| thread.name.clone()),
                 entrypoint,
                 terminal: Some(key),
-                telemetry: None,
+                telemetry: thread.and_then(|thread| thread.telemetry.clone()),
             });
             osc_reports.push(osc_report(id, terminal));
         }

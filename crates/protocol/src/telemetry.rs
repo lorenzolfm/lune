@@ -229,6 +229,64 @@ impl UsageWindow {
     }
 }
 
+impl UsageWindow {
+    fn newer_than(&self, other: &Self) -> bool {
+        (self.resets_at, self.used_permille) > (other.resets_at, other.used_permille)
+    }
+}
+
+#[must_use]
+pub fn window_label(minutes: u64) -> Option<TelemetryText> {
+    const MINUTES_PER_HOUR: u64 = 60;
+    const MINUTES_PER_DAY: u64 = 24 * MINUTES_PER_HOUR;
+    if minutes == 0 {
+        return None;
+    }
+    let label = if minutes.is_multiple_of(MINUTES_PER_DAY) {
+        format!("{}d", minutes / MINUTES_PER_DAY)
+    } else if minutes.is_multiple_of(MINUTES_PER_HOUR) {
+        format!("{}h", minutes / MINUTES_PER_HOUR)
+    } else {
+        format!("{minutes}m")
+    };
+    TelemetryText::parse(&label)
+}
+
+#[must_use]
+pub fn freshest_windows<'a>(usages: impl IntoIterator<Item = &'a AgentUsage>) -> Vec<UsageWindow> {
+    let mut freshest: Vec<UsageWindow> = Vec::with_capacity(USAGE_WINDOWS_MAX);
+    for window in usages.into_iter().flat_map(AgentUsage::windows) {
+        let known = freshest
+            .iter()
+            .position(|known| known.label == window.label);
+        match known {
+            Some(known) if window.newer_than(&freshest[known]) => {
+                freshest[known] = window.clone();
+            }
+            None if freshest.len() < USAGE_WINDOWS_MAX => freshest.push(window.clone()),
+            Some(_) | None => {}
+        }
+    }
+    assert!(freshest.len() <= USAGE_WINDOWS_MAX);
+    freshest
+}
+
+pub fn share_windows<'a>(account: impl IntoIterator<Item = &'a mut AgentTelemetry>) {
+    let account: Vec<&mut AgentTelemetry> = account.into_iter().collect();
+    let freshest = freshest_windows(account.iter().filter_map(|telemetry| telemetry.usage()));
+    if freshest.is_empty() {
+        return;
+    }
+    for telemetry in account {
+        if telemetry.draws_on_windows() {
+            let cost = telemetry
+                .usage()
+                .and_then(AgentUsage::session_cost_micro_usd);
+            telemetry.usage = AgentUsage::new(freshest.clone(), cost);
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentUsage {
     windows: Vec<UsageWindow>,
@@ -330,6 +388,16 @@ impl AgentTelemetry {
     #[must_use]
     pub fn usage(&self) -> Option<&AgentUsage> {
         self.usage.as_ref()
+    }
+
+    #[must_use]
+    pub fn draws_on_windows(&self) -> bool {
+        match &self.usage {
+            None => true,
+            Some(usage) => {
+                usage.has_windows() || usage.session_cost_micro_usd().is_none_or(|cost| cost == 0)
+            }
+        }
     }
 
     #[must_use]
@@ -559,6 +627,80 @@ mod tests {
             ..v1::AgentTelemetry::default()
         };
         assert_eq!(AgentTelemetry::of_api(&invalid_context), None);
+    }
+
+    #[test]
+    fn an_account_s_agents_share_its_freshest_windows_but_a_billed_session_keeps_its_cost() {
+        let reset = UNIX_EPOCH + Duration::from_secs(1_800_000_007);
+        let window = |label: &str, used: u16, resets_at: Option<SystemTime>| UsageWindow {
+            label: TelemetryText::parse(label).unwrap(),
+            used_permille: UsedPermille::try_new(used).unwrap(),
+            resets_at,
+        };
+        let told = |windows: Vec<UsageWindow>, cost: Option<u64>| {
+            AgentTelemetry::new(
+                TelemetryText::parse("Opus 4.7"),
+                None,
+                None,
+                AgentUsage::new(windows, cost),
+            )
+            .unwrap()
+        };
+        let labels = |telemetry: &AgentTelemetry| -> Vec<(String, u16)> {
+            let usage = telemetry.usage().unwrap();
+            let shown = |window: &UsageWindow| {
+                (window.label.as_str().to_owned(), window.used_permille.get())
+            };
+            usage.windows().iter().map(shown).collect()
+        };
+
+        let later = reset + Duration::from_hours(168);
+        let mut idle = told(vec![window("7d", 400, Some(reset))], Some(900_000));
+        let mut busy = told(vec![window("7d", 630, Some(reset))], Some(120_000));
+        let mut fresh = told(Vec::new(), Some(0));
+        let mut unbilled = told(Vec::new(), None);
+        let mut billed = told(Vec::new(), Some(260_000));
+        share_windows([&mut idle, &mut busy, &mut fresh, &mut unbilled, &mut billed]);
+        for shared in [&idle, &busy, &fresh, &unbilled] {
+            assert_eq!(labels(shared), [("7d".to_owned(), 630)]);
+        }
+        assert_eq!(
+            idle.usage().unwrap().session_cost_micro_usd(),
+            Some(900_000)
+        );
+        assert!(!billed.usage().unwrap().has_windows());
+        assert_eq!(
+            billed.usage().unwrap().session_cost_micro_usd(),
+            Some(260_000)
+        );
+
+        let mut before = told(vec![window("7d", 990, Some(reset))], None);
+        let mut after = told(
+            vec![window("7d", 20, Some(later)), window("5h", 10, None)],
+            None,
+        );
+        share_windows([&mut before, &mut after]);
+        assert_eq!(
+            labels(&before),
+            [("7d".to_owned(), 20), ("5h".to_owned(), 10)],
+            "a window that resets later is the one the account is in now"
+        );
+        assert_eq!(before, after);
+
+        let mut alone = told(Vec::new(), Some(260_000));
+        let kept = alone.clone();
+        share_windows([&mut alone]);
+        assert_eq!(alone, kept);
+    }
+
+    #[test]
+    fn a_window_is_labelled_by_its_largest_whole_unit() {
+        let label = |minutes| window_label(minutes).map(|label| label.as_str().to_owned());
+        assert_eq!(label(0), None);
+        assert_eq!(label(300).as_deref(), Some("5h"));
+        assert_eq!(label(10_080).as_deref(), Some("7d"));
+        assert_eq!(label(1_440).as_deref(), Some("1d"));
+        assert_eq!(label(90).as_deref(), Some("90m"));
     }
 
     #[test]

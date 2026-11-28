@@ -8148,4 +8148,111 @@ mod tests {
         );
         assert!(app.pane.collapsed());
     }
+
+    #[test]
+    fn status_bar_shows_an_agent_only_the_limits_of_its_own_harness() {
+        use luned::api::{self, Harness};
+
+        let (mut terminal, _written) = test_terminal(160, 12);
+        let (mut app, _inbox, _state) = test_app(160, 12);
+        let start = Instant::now();
+        let system = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_007);
+        let at = |offset| Moment {
+            steady: start + offset,
+            system: system + offset,
+        };
+        let windowed = |label: &str, used_permille: u32| api::AgentTelemetry {
+            usage: Some(api::AgentUsage {
+                windows: vec![api::UsageWindow {
+                    label: label.to_owned(),
+                    used_permille,
+                    resets_at: None,
+                }],
+                session_cost_micro_usd: None,
+            }),
+            ..api::AgentTelemetry::default()
+        };
+        let make_host = |sibling: bool| {
+            let mut host = busy_host(3, "Work on status bar");
+            let made_at = Some(prost_types::Timestamp::default());
+            let mut focused = host.agents[0].clone();
+            focused.pid = 1;
+            focused.terminal = Some(api::TerminalKey { id: 1, made_at });
+            focused.telemetry = Some(api::AgentTelemetry {
+                model: Some("Fable 5.2".to_owned()),
+                ..api::AgentTelemetry::default()
+            });
+            let mut other = host.agents[0].clone();
+            other.pid = 2;
+            other.harness = Some(Harness::Antigravity.into());
+            other.terminal = Some(api::TerminalKey { id: 2, made_at });
+            other.telemetry = Some(windowed("5h", 350));
+            host.agents[0].telemetry = Some(windowed("7d", 630));
+            if !sibling {
+                host.agents.clear();
+            }
+            host.agents.extend([focused, other]);
+            host
+        };
+
+        let on_view = |focused| RightTarget::Worktree {
+            on: Machine::Local,
+            worktree: WorktreeId::of(100).unwrap(),
+            focused: Some(focused),
+        };
+        let on_agent = on_view(viewed::FocusedView::Terminal {
+            id: ViewId::of(1).unwrap(),
+            key: None,
+        });
+        let labels = |snapshot: &statusbar::Snapshot| {
+            let (harness, usage) = snapshot.fallback_usage.as_ref()?;
+            let labels: Vec<String> = usage
+                .windows()
+                .iter()
+                .map(|window| window.label.as_str().to_owned())
+                .collect();
+            Some((*harness, labels))
+        };
+
+        app.handle_at(
+            Event::Daemon(Ok(make_host(true))),
+            &mut terminal,
+            at(Duration::ZERO),
+        )
+        .unwrap();
+        let wall = at(Duration::ZERO).system;
+        let bar = app.sidebar.status_bar(&on_agent, None, false, false, wall);
+        let view = bar.view.as_ref().unwrap();
+        assert_eq!(view.harness, Some(agents::Harness::ClaudeCode));
+        let model = view.telemetry.as_ref().unwrap().model().unwrap();
+        assert_eq!(model.as_str(), "Fable 5.2");
+        assert_eq!(
+            labels(&bar),
+            Some((agents::Harness::ClaudeCode, vec!["7d".to_owned()]))
+        );
+
+        let later = Duration::from_secs(1);
+        app.handle_at(
+            Event::Daemon(Ok(make_host(false))),
+            &mut terminal,
+            at(later),
+        )
+        .unwrap();
+        let wall = at(later).system;
+        let bar = app.sidebar.status_bar(&on_agent, None, false, false, wall);
+        assert!(bar.view.is_some());
+        assert_eq!(
+            labels(&bar),
+            None,
+            "another harness's limits are not this agent's"
+        );
+        let on_welcome = on_view(viewed::FocusedView::Welcome);
+        let bar = app
+            .sidebar
+            .status_bar(&on_welcome, None, false, false, wall);
+        assert_eq!(
+            labels(&bar),
+            Some((agents::Harness::Antigravity, vec!["5h".to_owned()]))
+        );
+    }
 }
