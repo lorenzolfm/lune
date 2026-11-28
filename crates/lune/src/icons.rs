@@ -17,9 +17,9 @@ const CLAUDE: &str = "\u{ec82}";
 
 const PI: &str = "\u{f03ff}";
 
-const AGY: &str = "\u{f0674}";
+const AGY: &str = "\u{f1a0}";
 
-const CODEX: &str = "\u{f07b5}";
+const CODEX: &str = "\u{ec81}";
 
 const PYTHON: &str = "\u{e73c}";
 
